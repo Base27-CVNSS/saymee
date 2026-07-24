@@ -676,7 +676,7 @@ class BrowserSpeechPipeline {
     this.stopPromise = null;
     this.manualStop = false;
     this.generation = 0;
-    this.sessionId = Date.now();
+    this.sessionId = runtimeState.session?.id || `browser-${Date.now()}`;
   }
 
   async start() {
