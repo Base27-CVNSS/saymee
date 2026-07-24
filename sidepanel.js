@@ -1,3 +1,5 @@
+import { buildExport, exportTxt } from './transcript-core.mjs';
+
 const SETTINGS_KEY = 'saymeeLiveSettings';
 const SESSION_API_KEY = 'saymeeSessionApiKey';
 const LEGACY_SETTINGS_KEY = 'saydiLiveSettings';
@@ -45,8 +47,10 @@ const elements = {
   transcriptCount: document.querySelector('#transcriptCount'),
   wordCount: document.querySelector('#wordCount'),
   copyButton: document.querySelector('#copyButton'),
+  exportFormat: document.querySelector('#exportFormat'),
   exportButton: document.querySelector('#exportButton'),
-  clearButton: document.querySelector('#clearButton')
+  clearButton: document.querySelector('#clearButton'),
+  jumpLive: document.querySelector('#jumpLive')
 };
 
 const transcriptState = {
@@ -58,6 +62,9 @@ let capabilities = null;
 
 let runtimePhase = 'idle';
 let startedAt = null;
+let currentSession = null;
+let restoreGeneration = 0;
+let followLive = true;
 let timerHandle = null;
 let busy = false;
 let activeEngine = 'deepgram';
@@ -492,6 +499,29 @@ function mergeRuntimeTranscripts(items) {
   }
 }
 
+function resetTranscriptState() {
+  transcriptState.final = [];
+  transcriptState.working.clear();
+  followLive = true;
+  elements.jumpLive.classList.add('hidden');
+}
+
+async function restoreSessionData(expectedSessionId = null) {
+  const generation = ++restoreGeneration;
+  const response = await chrome.runtime.sendMessage({ type: 'GET_SESSION_DATA' });
+  if (!response?.ok) throw new Error(response?.error || 'Không khôi phục được phiên chép lời.');
+  if (generation !== restoreGeneration) return;
+  if (expectedSessionId && response.session?.id !== expectedSessionId) return;
+
+  const incomingSession = response.session || null;
+  if (incomingSession?.id && incomingSession.id !== currentSession?.id) {
+    resetTranscriptState();
+  }
+  currentSession = incomingSession;
+  mergeRuntimeTranscripts(response.segments);
+  renderTranscripts();
+}
+
 const diagnosticLabels = {
   capabilities: 'API trình duyệt',
   session: 'Phiên nhận dạng',
@@ -604,6 +634,13 @@ async function copyDiagnostics() {
 function applyRuntimeState(state) {
   if (!state) return;
   startedAt = state.startedAt || startedAt;
+  if (state.session?.id && state.session.id !== currentSession?.id) {
+    resetTranscriptState();
+    currentSession = state.session;
+    restoreSessionData(state.session.id).catch((error) => showError(error.message));
+  } else if (state.session) {
+    currentSession = state.session;
+  }
   setGlobalPhase(state.phase);
   renderSourceState('tab', state.sources?.tab);
   renderSourceState('mic', state.sources?.mic);
@@ -614,10 +651,12 @@ function applyRuntimeState(state) {
   updateTimer();
 
   if (state.error) showError(state.error);
+  else clearError();
 }
 
 function upsertTranscript(event) {
   if (!event?.id || !event.text) return;
+  if (event.sessionId && currentSession?.id && event.sessionId !== currentSession.id) return;
 
   if (event.final) {
     transcriptState.working.delete(event.id);
@@ -668,16 +707,20 @@ function createEmptyState() {
   const title = document.createElement('strong');
   title.textContent = 'Chưa có nội dung';
   const detail = document.createElement('span');
-  detail.textContent = 'Chọn Microphone và nhấn “Bắt đầu nhận dạng”.';
+  detail.textContent = 'Chọn nguồn âm thanh rồi nhấn “Bắt đầu nhận dạng”.';
   empty.append(icon, title, detail);
   return empty;
 }
 
 function renderTranscripts(scrollToEnd = false) {
+  const previousScrollTop = elements.transcriptList.scrollTop;
   const items = [
     ...transcriptState.final.map((event) => ({ event, partial: false })),
     ...transcriptState.working.values().map((event) => ({ event, partial: true }))
-  ].sort((a, b) => (a.event.receivedAt || 0) - (b.event.receivedAt || 0));
+  ].sort((a, b) => (
+    (a.event.startMs ?? a.event.receivedAt ?? 0)
+    - (b.event.startMs ?? b.event.receivedAt ?? 0)
+  ));
 
   elements.transcriptList.replaceChildren();
   if (items.length === 0) {
@@ -692,42 +735,49 @@ function renderTranscripts(scrollToEnd = false) {
   const words = allText ? allText.split(/\s+/u).length : 0;
   elements.transcriptCount.textContent = `${transcriptState.final.length} đoạn`;
   elements.wordCount.textContent = `${words} từ`;
-  if (scrollToEnd) elements.transcriptList.scrollTop = elements.transcriptList.scrollHeight;
+  if (scrollToEnd && followLive) {
+    elements.transcriptList.scrollTop = elements.transcriptList.scrollHeight;
+  } else if (!followLive) {
+    elements.transcriptList.scrollTop = previousScrollTop;
+  }
+  elements.jumpLive.classList.toggle('hidden', followLive || items.length === 0);
 }
 
-function transcriptAsText() {
-  return transcriptState.final.map((item) => {
-    const source = item.source === 'tab' ? 'TAB' : 'MIC';
-    const speaker = Number.isFinite(item.speaker) ? ` / Người ${item.speaker + 1}` : '';
-    const time = new Date(item.receivedAt || Date.now()).toLocaleTimeString('vi-VN');
-    return `[${time}] [${source}${speaker}] ${item.text}`;
-  }).join('\n');
+async function getCompleteTranscript() {
+  const response = await chrome.runtime.sendMessage({ type: 'GET_SESSION_DATA' });
+  if (!response?.ok) throw new Error(response?.error || 'Không đọc được dữ liệu phiên.');
+  if (response.session) currentSession = response.session;
+  return {
+    session: response.session || currentSession || {},
+    segments: response.segments || transcriptState.final
+  };
 }
 
 async function copyTranscript() {
-  const text = transcriptAsText();
+  const { segments } = await getCompleteTranscript();
+  const text = exportTxt(segments);
   if (!text) return;
   await navigator.clipboard.writeText(text);
   elements.copyButton.textContent = 'Đã chép';
   setTimeout(() => { elements.copyButton.textContent = 'Sao chép'; }, 1200);
 }
 
-function exportTranscript() {
-  const text = transcriptAsText();
-  if (!text) return;
-  const withBom = `\uFEFF${text}`;
-  const blob = new Blob([withBom], { type: 'text/plain;charset=utf-8' });
+async function exportTranscript() {
+  const { session, segments } = await getCompleteTranscript();
+  if (!segments.length) return;
+  const exported = buildExport(elements.exportFormat.value, session, segments);
+  const blob = new Blob([exported.content], { type: exported.mime });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = `saymee-live-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+  const exportedAt = new Date(session.startedAt || Date.now()).toISOString().replace(/[:.]/g, '-');
+  anchor.download = `saymee-live-${exportedAt}.${exported.extension}`;
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function clearTranscript() {
-  transcriptState.final = [];
-  transcriptState.working.clear();
+  resetTranscriptState();
   renderTranscripts();
   const response = await chrome.runtime.sendMessage({ type: 'CLEAR_TRANSCRIPTS' });
   if (!response?.ok) throw new Error(response?.error || 'Không xóa được bản chép lời.');
@@ -814,8 +864,25 @@ elements.grantMic.addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'OPEN_MIC_PERMISSION' }).catch((error) => showError(error.message));
 });
 elements.copyButton.addEventListener('click', () => copyTranscript().catch((error) => showError(error.message)));
-elements.exportButton.addEventListener('click', exportTranscript);
+elements.exportButton.addEventListener('click', () => exportTranscript().catch((error) => showError(error.message)));
 elements.clearButton.addEventListener('click', () => clearTranscript().catch((error) => showError(error.message)));
+elements.transcriptList.addEventListener('scroll', () => {
+  const distanceToBottom = (
+    elements.transcriptList.scrollHeight
+    - elements.transcriptList.scrollTop
+    - elements.transcriptList.clientHeight
+  );
+  followLive = distanceToBottom < 48;
+  elements.jumpLive.classList.toggle(
+    'hidden',
+    followLive || (!transcriptState.final.length && !transcriptState.working.size)
+  );
+});
+elements.jumpLive.addEventListener('click', () => {
+  followLive = true;
+  elements.transcriptList.scrollTop = elements.transcriptList.scrollHeight;
+  elements.jumpLive.classList.add('hidden');
+});
 elements.runDiagnostic.addEventListener('click', runCapabilityCheck);
 elements.copyDiagnostic.addEventListener('click', () => {
   copyDiagnostics().catch((error) => showError(error.message));
@@ -839,7 +906,10 @@ await runCapabilityCheck();
 
 try {
   const response = await chrome.runtime.sendMessage({ type: 'GET_RUNTIME_STATE' });
-  if (response?.ok) applyRuntimeState(response.state);
+  if (response?.ok) {
+    applyRuntimeState(response.state);
+    await restoreSessionData(response.state?.session?.id || null);
+  }
 } catch {
   setGlobalPhase('idle');
 }

@@ -44,7 +44,7 @@
 Saymee biến âm thanh đang phát trong trình duyệt thành văn bản trực tiếp ngay trong Side Panel của Chrome:
 
 ```text
-Mở nội dung → Bấm Saymee → Chọn nguồn → Bắt đầu nhận dạng → Theo dõi transcript → Sao chép/Xuất TXT
+Mở nội dung → Bấm Saymee → Chọn nguồn → Bắt đầu nhận dạng → Theo dõi transcript → Sao chép/Xuất dữ liệu
 ```
 
 | | Khả năng nổi bật |
@@ -56,7 +56,8 @@ Mở nội dung → Bấm Saymee → Chọn nguồn → Bắt đầu nhận dạ
 | 👥 **Speaker Diarization** | Hiển thị người nói khi Deepgram trả dữ liệu diarization |
 | 📊 **Live Telemetry** | Mức âm lượng, thời lượng, số đoạn, số từ và trạng thái từng nguồn |
 | 🧰 **Chẩn đoán theo tầng** | Theo dõi MediaStream, AudioContext, AudioWorklet, PCM, token, WebSocket và transcript |
-| 📄 **Xuất dữ liệu thuận tiện** | Sao chép toàn bộ hoặc xuất TXT UTF-8 có BOM, tương thích tốt với tiếng Việt trên Windows |
+| 💾 **Khôi phục phiên cục bộ** | Final transcript được lưu bằng IndexedDB và nạp lại khi Side Panel mở lại |
+| 📄 **Xuất dữ liệu tiêu chuẩn** | Sao chép hoặc xuất TXT, JSON, SRT và WebVTT với Unicode, metadata và timestamp |
 
 ### Trường hợp sử dụng
 
@@ -104,18 +105,23 @@ flowchart TB
     BG <--> OFF["Offscreen Audio Runtime"]
     OFF --> DG["Deepgram Streaming Pipeline"]
     OFF --> CS["Chrome Speech Pipeline"]
-    DG --> UI
-    CS --> UI
+    DG --> NORMAL["Transcript Normalizer"]
+    CS --> NORMAL
+    NORMAL --> STORE["IndexedDB · Session Store"]
+    NORMAL --> UI
+    STORE <--> UI
 ```
 
 ### Vai trò từng lớp
 
 | Lớp | Tệp chính | Trách nhiệm |
 |---|---|---|
-| **Presentation** | `sidepanel.html`, `sidepanel.css`, `sidepanel.js` | Cấu hình phiên, trạng thái nguồn, transcript, xuất TXT và chẩn đoán |
+| **Presentation** | `sidepanel.html`, `sidepanel.css`, `sidepanel.js` | Cấu hình phiên, trạng thái nguồn, transcript, export đa định dạng và chẩn đoán |
 | **Browser orchestration** | `background.js` | Side Panel API, tab context, `activeTab`, stream ID, Offscreen Document và message routing |
 | **Audio/STT runtime** | `offscreen.html`, `offscreen.js` | MediaStream, AudioContext, Deepgram WebSocket, Chrome Speech, reconnect và dọn tài nguyên |
 | **Audio processing** | `audio-worklet.js` | Mono downmix, resample và tạo PCM16 ở 16 kHz |
+| **Transcript core** | `transcript-core.mjs` | Session, normalized event, dedupe, media timestamp và export TXT/JSON/SRT/VTT |
+| **Local persistence** | `transcript-store.mjs` | IndexedDB `saymee-db` với object store `sessions` và `segments` |
 | **Permission flow** | `permission.html`, `permission.js` | Xin quyền microphone từ extension origin |
 | **Credential broker mẫu** | `server/token-server.mjs` | Đổi Deepgram API key phía máy chủ lấy temporary access token |
 
@@ -126,14 +132,14 @@ stateDiagram-v2
     [*] --> Idle
     Idle --> Starting: Bắt đầu
     Starting --> Streaming: Audio và engine sẵn sàng
-    Streaming --> Reconnecting: WebSocket gián đoạn
-    Reconnecting --> Streaming: Kết nối phục hồi
-    Streaming --> Stopping: Dừng phiên
-    Reconnecting --> Stopping: Dừng phiên
-    Stopping --> Idle: Dọn tài nguyên
+Streaming --> Reconnecting: WebSocket gián đoạn
+Reconnecting --> Streaming: Kết nối phục hồi
+Streaming --> Stopping: Dừng phiên
+Reconnecting --> Stopping: Dừng phiên
+Stopping --> Idle: Dọn tài nguyên
 ```
 
-Saymee chỉ hiển thị **Đang nghe** sau khi pipeline tương ứng đã khởi động. Khi dừng, runtime đóng MediaStream tracks, AudioWorklet, AudioContext, WebSocket và timer thuộc phiên.
+Saymee chỉ hiển thị **Đang nghe** sau khi pipeline tương ứng đã khởi động. Mỗi phiên có ID và metadata độc lập với UI. Final transcript được ghi vào IndexedDB; interim chỉ nằm trong RAM/UI. Khi dừng, runtime đóng MediaStream tracks, AudioWorklet, AudioContext, WebSocket và timer thuộc phiên.
 
 ## 🧠 Hai công nghệ nhận dạng
 
@@ -237,6 +243,7 @@ Chế độ Chrome Speech:
 | **WebSocket** | Truyền audio streaming và nhận kết quả Deepgram |
 | **Web Speech API** | `SpeechRecognition` cho chế độ Chrome Speech |
 | **Chrome Storage API** | Lưu cấu hình và API key theo lựa chọn người dùng |
+| **IndexedDB** | Lưu session metadata và toàn bộ final transcript ở máy người dùng |
 
 ## ⚙️ Cấu hình mặc định
 
@@ -414,12 +421,15 @@ Không:
 |---|---|
 | **Sao chép** | Đưa toàn bộ transcript hoàn chỉnh vào clipboard |
 | **Xuất TXT** | Tạo tệp UTF-8 có BOM để hiển thị đúng tiếng Việt trên Windows |
-| **Xóa** | Xóa transcript của phiên hiện tại khỏi UI và runtime |
+| **Xuất JSON** | Giữ session metadata cùng schema đầy đủ: engine, source, timestamp, speaker và confidence |
+| **Xuất SRT** | Tạo phụ đề dùng media timeline với dấu phân cách millisecond dạng dấu phẩy |
+| **Xuất WebVTT** | Tạo phụ đề `WEBVTT` dùng media timeline với dấu phân cách millisecond dạng dấu chấm |
+| **Xóa** | Xóa transcript của phiên hiện tại khỏi UI, cache runtime và IndexedDB |
 | **Nhãn nguồn** | `TAB` cho âm thanh tab, `MIC` cho microphone |
 | **Nhãn người nói** | Hiển thị khi Deepgram cung cấp speaker diarization |
-| **Thời gian** | Ghi thời điểm nhận từng đoạn transcript |
+| **Thời gian** | Phân biệt media timeline cho phụ đề và wall clock cho lịch sử/diagnostics |
 
-Saymee không tự lưu audio và không có cơ sở dữ liệu transcript. Hãy sao chép hoặc xuất TXT trước khi đóng nếu cần giữ nội dung.
+Saymee không tự lưu audio và không đồng bộ transcript lên cloud. Final transcript được lưu cục bộ trong IndexedDB của extension để Side Panel có thể khôi phục phiên; dữ liệu này vẫn thuộc profile Chrome hiện tại.
 
 ## 🛡️ Quyền riêng tư và bảo mật
 
@@ -429,6 +439,7 @@ Saymee không tự lưu audio và không có cơ sở dữ liệu transcript. H�
 - Token server mẫu chỉ cấp thông tin xác thực; nó không nhận audio từ Saymee.
 - Nhật ký kỹ thuật không chứa API key, temporary token hoặc nội dung xác thực.
 - Bấm **Dừng phiên** sẽ đóng audio tracks, AudioContext và WebSocket.
+- Final transcript được lưu cục bộ trong IndexedDB; nút **Xóa** xóa các segment của phiên hiện tại.
 - Kho mã không chứa API key hoặc token dựng sẵn.
 
 > [!CAUTION]
@@ -527,6 +538,8 @@ Mở **Chẩn đoán kỹ thuật → Kiểm tra lại API**, bắt đầu một
 ├── offscreen.html
 ├── offscreen.js
 ├── audio-worklet.js
+├── transcript-core.mjs
+├── transcript-store.mjs
 ├── permission.html
 ├── permission.js
 ├── icons/
@@ -539,7 +552,10 @@ Mở **Chẩn đoán kỹ thuật → Kiểm tra lại API**, bắt đầu một
 │   ├── package.json
 │   └── token-server.mjs
 ├── tests/
-│   └── smoke.mjs
+│   ├── smoke.mjs
+│   ├── transcript-core.mjs
+│   ├── recovery.mjs
+│   └── regression.mjs
 └── LICENSE
 ```
 
@@ -553,13 +569,18 @@ node --check sidepanel.js
 node --check offscreen.js
 node --check audio-worklet.js
 node --check permission.js
+node --check transcript-core.mjs
+node --check transcript-store.mjs
 node --check server/token-server.mjs
 ```
 
-Chạy smoke test:
+Chạy test:
 
 ```bash
 node tests/smoke.mjs
+node tests/transcript-core.mjs
+node tests/recovery.mjs
+node tests/regression.mjs
 ```
 
 Trước khi phát hành, cần kiểm tra thực tế:
@@ -574,6 +595,8 @@ Trước khi phát hành, cần kiểm tra thực tế:
 - token sai hoặc hết hạn;
 - mất mạng và reconnect;
 - Start/Stop nhiều lần;
+- đóng/mở Side Panel trong khi đang nhận dạng;
+- phiên dài trên 1.000 final segment và export đủ bốn định dạng;
 - chạy liên tục ít nhất 30 phút;
 - nâng cấp từ Saydi mà không mất cấu hình.
 
@@ -604,7 +627,6 @@ Saymee v1.1.0 tập trung vào **Speech-to-Text thời gian thực**. Phiên b�
 - dịch máy;
 - tóm tắt tự động;
 - lưu audio;
-- cơ sở dữ liệu transcript;
 - đồng bộ transcript lên cloud.
 
 Độ chính xác phụ thuộc chất lượng âm thanh, ngôn ngữ, người nói, engine, mạng và hạn mức dịch vụ.

@@ -9,6 +9,7 @@ const background = await readFile(resolve(root, 'background.js'), 'utf8');
 const offscreen = await readFile(resolve(root, 'offscreen.js'), 'utf8');
 const panel = await readFile(resolve(root, 'sidepanel.js'), 'utf8');
 const panelHtml = await readFile(resolve(root, 'sidepanel.html'), 'utf8');
+const transcriptStore = await readFile(resolve(root, 'transcript-store.mjs'), 'utf8');
 
 assert.equal(manifest.manifest_version, 3);
 assert.equal(manifest.version, '1.1.0');
@@ -26,6 +27,20 @@ assert.match(offscreen, /TOKEN_FETCH_FAILED/);
 assert.match(offscreen, /interim_results/);
 assert.match(offscreen, /createDesktopStream/);
 assert.match(offscreen, /logDiagnostic/);
+assert.match(offscreen, /markSourceRecovered/);
+assert.match(offscreen, /reconnectTimer/);
+assert.match(offscreen, /config\.engine \|\| 'deepgram'/);
+assert.match(offscreen, /normalizeTranscriptEvent/);
+assert.match(offscreen, /GET_SESSION_DATA/);
+assert.match(offscreen, /socketSampleBase/);
+assert.match(offscreen, /reconnectStableTimer/);
+assert.match(offscreen, /AUDIO_CONTEXT_SUSPENDED/);
+assert.match(offscreen, /recentFinalFingerprints/);
+assert.match(offscreen, /MIC_REMOVED/);
+assert.match(background, /GET_SESSION_DATA/);
+assert.match(transcriptStore, /saymee-db/);
+assert.match(transcriptStore, /createObjectStore\(SESSION_STORE/);
+assert.match(transcriptStore, /createObjectStore\(SEGMENT_STORE/);
 assert.match(panel, /GET_TAB_CONTEXT/);
 assert.match(panel, /chooseDesktopMedia\(\['tab', 'audio'\]/);
 assert.match(panel, /startButton\.addEventListener\('click', beginStartFromGesture\)/);
@@ -35,7 +50,14 @@ assert.match(panel, /source:\s*'tab'/);
 assert.match(panel, /tabCaptureMode:\s*'active_tab'/);
 assert.match(panel, /LEGACY_SETTINGS_KEY\s*=\s*'saydiLiveSettings'/);
 assert.match(panel, /LEGACY_SESSION_API_KEY\s*=\s*'saydiSessionApiKey'/);
+assert.match(panel, /buildExport/);
+assert.match(panel, /GET_SESSION_DATA/);
+assert.match(panel, /followLive/);
 assert.match(panelHtml, /Chrome Speech/);
+for (const format of ['txt', 'json', 'srt', 'vtt']) {
+  assert.match(panelHtml, new RegExp(`<option value="${format}">`, 'u'));
+}
+assert.match(panelHtml, /id="jumpLive"/);
 assert.match(manifest.name, /Saymee/);
 
 console.log('Saymee Live STT smoke test: OK');

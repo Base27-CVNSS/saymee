@@ -211,6 +211,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       }
 
+      case 'GET_SESSION_DATA': {
+        const result = await sendToOffscreen({ type: 'GET_SESSION_DATA' });
+        sendResponse(result || { ok: true, session: null, segments: [] });
+        break;
+      }
+
       case 'OPEN_MIC_PERMISSION': {
         await chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
         sendResponse({ ok: true });
