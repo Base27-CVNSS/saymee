@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Saymee Live STT</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-mark" aria-hidden="true">S</div>
+    <div class="brand-copy">
+      <h1>Saymee Live STT</h1>
+      <p>Chép lời tiếng Việt theo thời gian thực</p>
+    </div>
+    <div class="header-state">
+      <span id="globalStatus" class="status-pill idle">Sẵn sàng</span>
+      <time id="sessionTimer">00:00</time>
+    </div>
+  </header>
+
+  <main>
+    <section class="card setup-card" aria-labelledby="setupTitle">
+      <div class="section-title">
+        <div>
+          <span class="eyebrow">Cấu hình phiên</span>
+          <h2 id="setupTitle">Nguồn và nhận dạng</h2>
+        </div>
+      </div>
+
+      <div class="grid-two">
+        <div class="field">
+          <label for="engine">Công cụ nhận dạng</label>
+          <select id="engine">
+            <option value="deepgram">Deepgram — tab và microphone</option>
+            <option value="browser">Chrome Speech — microphone, không cần API</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="source">Nguồn âm thanh</label>
+          <select id="source">
+            <option value="mic">Microphone</option>
+            <option value="tab">Tab hiện tại</option>
+            <option value="both">Tab + Microphone</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid-two">
+        <div class="field">
+          <label for="language">Ngôn ngữ</label>
+          <select id="language">
+            <option value="vi">Tiếng Việt</option>
+            <option value="en">Tiếng Anh</option>
+            <option value="multi">Đa ngôn ngữ (Deepgram)</option>
+          </select>
+        </div>
+        <div class="field checkbox-field">
+          <label>
+            <input id="diarize" type="checkbox" checked>
+            Phân biệt người nói ở tab
+          </label>
+        </div>
+      </div>
+
+      <div id="tabCaptureModeGroup" class="field hidden">
+        <label for="tabCaptureMode">Cách lấy âm thanh tab</label>
+        <select id="tabCaptureMode">
+          <option value="active_tab">Tab hiện tại — activeTab, mặc định</option>
+          <option value="picker">Hộp chọn tab của Chrome — phương án dự phòng</option>
+        </select>
+        <small id="tabCaptureModeHint">Mở tab cần chép lời rồi bấm biểu tượng Saymee trên chính tab đó.</small>
+      </div>
+
+      <div id="browserNotice" class="notice info">
+        Chrome Speech thu trực tiếp microphone và hiển thị chữ tức thời. Chế độ này không cần token server.
+      </div>
+
+      <div id="tabContext" class="tab-context hidden" role="status">
+        <div class="tab-icon" aria-hidden="true">▣</div>
+        <div>
+          <strong id="tabContextTitle">Chưa chọn tab</strong>
+          <p id="tabContextDetail">Mở tab cần ghi rồi bấm biểu tượng extension trên thanh công cụ.</p>
+        </div>
+        <span id="tabContextBadge" class="context-badge pending">Chưa cấp quyền</span>
+      </div>
+
+      <details id="connectionSettings" class="connection-settings hidden">
+        <summary>Thiết lập kết nối Deepgram</summary>
+        <div class="settings-body">
+          <div class="field">
+            <label for="authMode">Xác thực</label>
+            <select id="authMode">
+              <option value="token_endpoint">Temporary token — khuyến nghị</option>
+              <option value="api_key">API key — chỉ dùng cục bộ</option>
+            </select>
+          </div>
+
+          <div id="tokenEndpointGroup" class="field">
+            <label for="tokenEndpoint">Token endpoint</label>
+            <div class="input-action">
+              <input id="tokenEndpoint" type="url" value="http://127.0.0.1:8787/token" spellcheck="false">
+              <button id="testConnection" type="button">Kiểm tra</button>
+            </div>
+            <small id="connectionTestStatus">Máy chủ mẫu nằm trong thư mục <code>server</code>.</small>
+          </div>
+
+          <div id="apiKeyGroup" class="field hidden">
+            <label for="apiKey">Deepgram API key</label>
+            <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="Dán API key để thử nghiệm cục bộ">
+            <label class="remember-row">
+              <input id="rememberApiKey" type="checkbox">
+              Lưu API key trên máy này
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <div class="permission-row">
+        <button id="grantMic" class="secondary" type="button">Cấp quyền microphone</button>
+        <span>Chỉ cần cấp một lần cho extension.</span>
+      </div>
+
+      <p id="errorBox" class="error-box hidden" role="alert"></p>
+
+      <div class="actions">
+        <button id="startButton" class="primary" type="button">
+          <span class="record-dot" aria-hidden="true"></span>
+          Bắt đầu nhận dạng
+        </button>
+        <button id="stopButton" class="danger" type="button" disabled>Dừng phiên</button>
+      </div>
+    </section>
+
+    <section class="source-grid" aria-label="Trạng thái nguồn âm thanh">
+      <article id="tabStatusCard" class="source-card muted">
+        <div class="source-title">
+          <span>Âm thanh tab</span>
+          <strong id="tabState">Tắt</strong>
+        </div>
+        <div class="meter" aria-hidden="true"><i id="tabLevel"></i></div>
+      </article>
+      <article id="micStatusCard" class="source-card muted">
+        <div class="source-title">
+          <span>Microphone</span>
+          <strong id="micState">Tắt</strong>
+        </div>
+        <div class="meter mic" aria-hidden="true"><i id="micLevel"></i></div>
+      </article>
+    </section>
+
+    <details id="diagnosticPanel" class="card diagnostic-card">
+      <summary>
+        <span>Chẩn đoán kỹ thuật</span>
+        <span id="capabilityStatus" class="diagnostic-summary">Đang kiểm tra…</span>
+      </summary>
+      <div class="diagnostic-body">
+        <div class="diagnostic-actions">
+          <button id="runDiagnostic" type="button">Kiểm tra lại API</button>
+          <button id="copyDiagnostic" type="button">Sao chép nhật ký</button>
+        </div>
+        <ul id="diagnosticList" class="diagnostic-list">
+          <li class="diagnostic-empty">Chưa có dữ liệu chẩn đoán.</li>
+        </ul>
+      </div>
+    </details>
+
+    <section class="card transcript-card" aria-labelledby="transcriptTitle">
+      <div class="transcript-heading">
+        <div>
+          <span class="eyebrow">Kết quả trực tiếp</span>
+          <h2 id="transcriptTitle">Bản chép lời</h2>
+          <p><span id="transcriptCount">0 đoạn</span> · <span id="wordCount">0 từ</span></p>
+        </div>
+        <div class="mini-actions">
+          <button id="copyButton" type="button">Sao chép</button>
+          <button id="exportButton" type="button">Xuất TXT</button>
+          <button id="clearButton" type="button">Xóa</button>
+        </div>
+      </div>
+
+      <div id="transcriptList" class="transcript-list" aria-live="polite" aria-relevant="additions text">
+        <div class="empty-state">
+          <div class="empty-icon" aria-hidden="true">≋</div>
+          <strong>Chưa có nội dung</strong>
+          <span>Chọn Microphone và nhấn “Bắt đầu nhận dạng”.</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Audio chỉ được thu khi trạng thái hiển thị “Đang nghe”.
+  </footer>
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>

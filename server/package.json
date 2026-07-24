@@ -1,0 +1,21 @@
+{
+  "name": "saymee-live-token-server",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Máy chủ mẫu cấp temporary token Deepgram cho Saymee Live STT.",
+  "author": "Long Ngo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Base27-CVNSS/saymee.git",
+    "directory": "server"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node token-server.mjs",
+    "check": "node --check token-server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

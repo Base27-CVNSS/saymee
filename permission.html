@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quyền microphone · Saymee Live STT</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #f3f6fb; }
+    main { max-width: 500px; margin: 20px; padding: 30px; border: 1px solid #dfe5ef; border-radius: 20px; background: white; color: #17202a; box-shadow: 0 18px 50px rgba(0,0,0,.08); }
+    h1 { margin-top: 0; font-size: 22px; }
+    p { color: #5d6878; line-height: 1.55; }
+    button { border: 0; border-radius: 11px; padding: 11px 16px; color: white; background: linear-gradient(135deg, #4f46e5, #7c3aed); font: inherit; font-weight: 750; cursor: pointer; }
+    #status { margin-top: 14px; font-weight: 650; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Cho phép dùng microphone</h1>
+    <p>Nhấn nút dưới đây và chọn <strong>Cho phép</strong>. Saymee Live STT chỉ thu âm khi bạn chủ động bắt đầu một phiên và luôn dừng track khi kết thúc.</p>
+    <button id="grant">Cấp quyền microphone</button>
+    <div id="status"></div>
+  </main>
+  <script type="module" src="permission.js"></script>
+</body>
+</html>
