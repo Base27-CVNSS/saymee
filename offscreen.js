@@ -1,5 +1,8 @@
+import { createSession, normalizeTranscriptEvent } from './transcript-core.mjs';
+import { TranscriptStore } from './transcript-store.mjs';
+
 const TARGET_SAMPLE_RATE = 16000;
-const MAX_TRANSCRIPTS = 1000;
+const MAX_TRANSCRIPT_CACHE = 300;
 const TOKEN_TIMEOUT_MS = 8000;
 const SpeechRecognitionApi = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
 
@@ -7,13 +10,18 @@ const runtimeState = {
   phase: 'idle',
   startedAt: null,
   config: null,
+  session: null,
   sources: {},
   transcripts: [],
+  transcriptCount: 0,
   diagnostics: [],
   error: null
 };
 
 const pipelines = new Map();
+const transcriptStore = new TranscriptStore();
+const persistedTranscriptIds = new Set();
+let persistenceQueue = Promise.resolve();
 let stopping = false;
 
 function nowIso() {
@@ -33,8 +41,10 @@ function serializeState() {
     phase: runtimeState.phase,
     startedAt: runtimeState.startedAt,
     config: runtimeState.config,
+    session: runtimeState.session,
     sources: runtimeState.sources,
-    transcripts: runtimeState.transcripts.slice(-300),
+    transcripts: runtimeState.transcripts.slice(-MAX_TRANSCRIPT_CACHE),
+    transcriptCount: runtimeState.transcriptCount,
     diagnostics: runtimeState.diagnostics.slice(-100),
     error: runtimeState.error
   };
@@ -90,14 +100,41 @@ function publishError(source, error) {
   safeSend({ type: 'RUNTIME_ERROR', source, error: text });
 }
 
-function publishTranscript(event) {
+function queuePersistence(operation, detail) {
+  persistenceQueue = persistenceQueue
+    .then(operation)
+    .catch((error) => {
+      logDiagnostic('persistence', 'warning', `${detail}: ${error?.message || error}`);
+    });
+  return persistenceQueue;
+}
+
+function publishTranscript(rawEvent) {
+  const event = normalizeTranscriptEvent(rawEvent, {
+    session: runtimeState.session,
+    engine: runtimeState.config?.engine,
+    source: rawEvent.source
+  });
+  if (!event.text || !event.sessionId) return;
+
   safeSend({ type: 'TRANSCRIPT_EVENT', event });
   if (!event.final) return;
 
-  runtimeState.transcripts.push(event);
-  if (runtimeState.transcripts.length > MAX_TRANSCRIPTS) {
-    runtimeState.transcripts.splice(0, runtimeState.transcripts.length - MAX_TRANSCRIPTS);
+  const existingIndex = runtimeState.transcripts.findIndex((item) => item.id === event.id);
+  if (existingIndex >= 0) runtimeState.transcripts[existingIndex] = event;
+  else runtimeState.transcripts.push(event);
+  if (runtimeState.transcripts.length > MAX_TRANSCRIPT_CACHE) {
+    runtimeState.transcripts.splice(
+      0,
+      runtimeState.transcripts.length - MAX_TRANSCRIPT_CACHE
+    );
   }
+
+  if (!persistedTranscriptIds.has(event.id)) {
+    persistedTranscriptIds.add(event.id);
+    runtimeState.transcriptCount += 1;
+  }
+  queuePersistence(() => transcriptStore.putSegment(event), 'Không lưu được transcript');
 }
 
 async function resolveCredential(config, source = null) {
@@ -208,12 +245,15 @@ class DirectSttPipeline {
     this.utteranceCounter = 1;
     this.workingId = this.makeUtteranceId();
     this.lastAudioAt = 0;
+    this.sentSamples = 0;
+    this.socketSampleBase = 0;
     this.sentFirstPcm = false;
     this.receivedFirstTranscript = false;
   }
 
   makeUtteranceId() {
-    return `${this.source}-${Date.now()}-${this.utteranceCounter}`;
+    const sessionId = runtimeState.session?.id || 'session';
+    return `${sessionId}-${this.source}-${Date.now()}-${this.utteranceCounter}`;
   }
 
   async start() {
@@ -271,6 +311,7 @@ class DirectSttPipeline {
         settled = true;
         opened = true;
         this.reconnectAttempts = 0;
+        this.socketSampleBase = this.sentSamples;
         logDiagnostic('websocket', 'ok', 'Deepgram WebSocket đã kết nối.', this.source);
         resolve();
       };
@@ -284,7 +325,11 @@ class DirectSttPipeline {
         }
       };
 
-      socket.onmessage = (event) => this.handleDeepgramMessage(event.data);
+      socket.onmessage = (event) => {
+        if (generation === this.socketGeneration && !this.manualStop) {
+          this.handleDeepgramMessage(event.data);
+        }
+      };
       socket.onclose = (event) => {
         if (generation !== this.socketGeneration) return;
         if (!settled) {
@@ -369,6 +414,7 @@ class DirectSttPipeline {
         }
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.socket.send(data.buffer);
+          this.sentSamples += Math.floor(data.buffer.byteLength / 2);
         }
       }
     };
@@ -398,7 +444,9 @@ class DirectSttPipeline {
         speechFinal: Boolean(message.speech_final),
         confidence: Number(alternative.confidence || 0),
         speaker,
-        startMs: Math.round(Number(message.start || 0) * 1000),
+        startMs: Math.round(
+          ((this.socketSampleBase / TARGET_SAMPLE_RATE) + Number(message.start || 0)) * 1000
+        ),
         durationMs: Math.round(Number(message.duration || 0) * 1000),
         receivedAt: Date.now()
       };
@@ -768,6 +816,17 @@ async function stopAll() {
   const active = [...pipelines.values()];
   pipelines.clear();
   await Promise.allSettled(active.map((pipeline) => pipeline.stop()));
+  if (runtimeState.session && !runtimeState.session.endedAt) {
+    runtimeState.session = {
+      ...runtimeState.session,
+      endedAt: Date.now()
+    };
+    queuePersistence(
+      () => transcriptStore.putSession(runtimeState.session),
+      'Không cập nhật được phiên'
+    );
+  }
+  await persistenceQueue;
   stopping = false;
   runtimeState.phase = 'idle';
   runtimeState.startedAt = null;
@@ -803,8 +862,21 @@ async function startSession(config, tabCapture) {
     model: runtimeConfig.model || 'nova-3',
     diarize: Boolean(runtimeConfig.diarize)
   };
+  runtimeState.session = createSession(runtimeState.config, {
+    startedAt: runtimeState.startedAt,
+    title: tabCapture?.title || (
+      source === 'mic' ? 'Phiên microphone Saymee' : 'Phiên Saymee'
+    )
+  });
   runtimeState.sources = {};
+  runtimeState.transcripts = [];
+  runtimeState.transcriptCount = 0;
+  persistedTranscriptIds.clear();
   runtimeState.error = null;
+  queuePersistence(
+    () => transcriptStore.putSession(runtimeState.session),
+    'Không tạo được phiên lưu trữ'
+  );
   logDiagnostic('session', 'pending', `Khởi động phiên bằng ${engine}.`);
   publishState();
 
@@ -869,6 +941,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return;
     }
 
+    if (message.type === 'GET_SESSION_DATA') {
+      await persistenceQueue;
+      let session = runtimeState.session;
+      let segments = runtimeState.transcripts;
+      try {
+        session ||= await transcriptStore.getLatestSession();
+        segments = session ? await transcriptStore.getSegments(session.id) : [];
+      } catch (error) {
+        logDiagnostic(
+          'persistence',
+          'warning',
+          `Đang dùng cache bộ nhớ vì chưa đọc được IndexedDB: ${error?.message || error}`
+        );
+      }
+      sendResponse({ ok: true, session, segments });
+      return;
+    }
+
     if (message.type === 'HEALTH_CHECK') {
       sendResponse({
         ok: true,
@@ -896,6 +986,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     if (message.type === 'CLEAR_TRANSCRIPTS') {
       runtimeState.transcripts = [];
+      runtimeState.transcriptCount = 0;
+      persistedTranscriptIds.clear();
+      if (runtimeState.session?.id) {
+        queuePersistence(
+          () => transcriptStore.clearSegments(runtimeState.session.id),
+          'Không xóa được transcript'
+        );
+        await persistenceQueue;
+      }
       publishState();
       sendResponse({ ok: true, state: serializeState() });
       return;

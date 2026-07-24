@@ -174,17 +174,29 @@
         </div>
         <div class="mini-actions">
           <button id="copyButton" type="button">Sao chép</button>
-          <button id="exportButton" type="button">Xuất TXT</button>
+          <label class="export-control">
+            <span class="sr-only">Định dạng xuất</span>
+            <select id="exportFormat" aria-label="Định dạng xuất">
+              <option value="txt">TXT</option>
+              <option value="json">JSON</option>
+              <option value="srt">SRT</option>
+              <option value="vtt">VTT</option>
+            </select>
+          </label>
+          <button id="exportButton" type="button">Xuất</button>
           <button id="clearButton" type="button">Xóa</button>
         </div>
       </div>
 
-      <div id="transcriptList" class="transcript-list" aria-live="polite" aria-relevant="additions text">
-        <div class="empty-state">
-          <div class="empty-icon" aria-hidden="true">≋</div>
-          <strong>Chưa có nội dung</strong>
-          <span>Chọn Microphone và nhấn “Bắt đầu nhận dạng”.</span>
+      <div class="transcript-viewport">
+        <div id="transcriptList" class="transcript-list" aria-live="polite" aria-relevant="additions text">
+          <div class="empty-state">
+            <div class="empty-icon" aria-hidden="true">≋</div>
+            <strong>Chưa có nội dung</strong>
+            <span>Chọn nguồn âm thanh rồi nhấn “Bắt đầu nhận dạng”.</span>
+          </div>
         </div>
+        <button id="jumpLive" class="jump-live hidden" type="button">↓ Trở về nội dung trực tiếp</button>
       </div>
     </section>
   </main>
