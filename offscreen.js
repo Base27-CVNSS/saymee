@@ -137,6 +137,61 @@ function publishTranscript(rawEvent) {
   queuePersistence(() => transcriptStore.putSegment(event), 'Không lưu được transcript');
 }
 
+function observeAudioContext(pipeline, source) {
+  const context = pipeline.audioContext;
+  if (!context?.addEventListener) return;
+
+  pipeline.audioContextStateHandler = () => {
+    if (
+      pipeline.manualStop
+      || !['suspended', 'interrupted'].includes(context.state)
+      || pipeline.audioRecoveryPromise
+    ) {
+      return;
+    }
+
+    const previousStatus = runtimeState.sources[source]?.status || 'streaming';
+    setSourceState(source, { status: 'reconnecting', audioContextState: context.state });
+    logDiagnostic(
+      'audio-context',
+      'warning',
+      `AudioContext chuyển sang ${context.state}; đang thử resume.`,
+      source
+    );
+
+    pipeline.audioRecoveryPromise = context.resume()
+      .then(() => {
+        if (pipeline.manualStop || context.state !== 'running') return;
+        const currentError = runtimeState.sources[source]?.error || '';
+        const patch = { status: previousStatus, audioContextState: 'running' };
+        if (currentError.startsWith('AUDIO_CONTEXT_')) markSourceRecovered(source, patch);
+        else setSourceState(source, patch);
+        logDiagnostic('audio-context', 'ok', 'AudioContext đã resume thành công.', source);
+      })
+      .catch((error) => {
+        const wrapped = new Error(
+          `AUDIO_CONTEXT_SUSPENDED|Không thể khôi phục AudioContext: ${error?.message || error}`
+        );
+        publishError(source, wrapped);
+        pipeline.stop({ preserveError: true }).catch(() => {});
+      })
+      .finally(() => {
+        pipeline.audioRecoveryPromise = null;
+      });
+  };
+  context.addEventListener('statechange', pipeline.audioContextStateHandler);
+  if (['suspended', 'interrupted'].includes(context.state)) {
+    queueMicrotask(pipeline.audioContextStateHandler);
+  }
+}
+
+function unobserveAudioContext(pipeline) {
+  if (pipeline.audioContext && pipeline.audioContextStateHandler) {
+    pipeline.audioContext.removeEventListener?.('statechange', pipeline.audioContextStateHandler);
+  }
+  pipeline.audioContextStateHandler = null;
+}
+
 async function resolveCredential(config, source = null) {
   if (config.authMode === 'api_key') {
     if (!config.apiKey?.trim()) throw new Error('Chưa nhập Deepgram API key.');
@@ -232,6 +287,10 @@ class DirectSttPipeline {
     this.mediaFactory = mediaFactory;
     this.stream = null;
     this.audioContext = null;
+    this.audioTrack = null;
+    this.trackEndedHandler = null;
+    this.audioContextStateHandler = null;
+    this.audioRecoveryPromise = null;
     this.sourceNode = null;
     this.workletNode = null;
     this.silentGain = null;
@@ -240,6 +299,8 @@ class DirectSttPipeline {
     this.socketGeneration = 0;
     this.connectPromise = null;
     this.reconnectTimer = null;
+    this.reconnectStableTimer = null;
+    this.stopPromise = null;
     this.manualStop = false;
     this.reconnectAttempts = 0;
     this.utteranceCounter = 1;
@@ -247,6 +308,7 @@ class DirectSttPipeline {
     this.lastAudioAt = 0;
     this.sentSamples = 0;
     this.socketSampleBase = 0;
+    this.recentFinalFingerprints = new Map();
     this.sentFirstPcm = false;
     this.receivedFirstTranscript = false;
   }
@@ -310,8 +372,18 @@ class DirectSttPipeline {
         clearTimeout(timeout);
         settled = true;
         opened = true;
-        this.reconnectAttempts = 0;
         this.socketSampleBase = this.sentSamples;
+        clearTimeout(this.reconnectStableTimer);
+        this.reconnectStableTimer = setTimeout(() => {
+          if (
+            generation === this.socketGeneration
+            && socket.readyState === WebSocket.OPEN
+            && !this.manualStop
+          ) {
+            this.reconnectAttempts = 0;
+            setSourceState(this.source, { reconnectAttempts: 0 });
+          }
+        }, 10000);
         logDiagnostic('websocket', 'ok', 'Deepgram WebSocket đã kết nối.', this.source);
         resolve();
       };
@@ -332,6 +404,8 @@ class DirectSttPipeline {
       };
       socket.onclose = (event) => {
         if (generation !== this.socketGeneration) return;
+        clearTimeout(this.reconnectStableTimer);
+        this.reconnectStableTimer = null;
         if (!settled) {
           clearTimeout(timeout);
           settled = true;
@@ -349,6 +423,7 @@ class DirectSttPipeline {
     this.stream = await this.mediaFactory();
     const track = this.stream.getAudioTracks()[0];
     if (!track) throw new Error(`Không có audio track cho nguồn ${this.source}.`);
+    this.audioTrack = track;
     const settings = track.getSettings?.() || {};
     logDiagnostic(
       'media',
@@ -357,17 +432,19 @@ class DirectSttPipeline {
       this.source
     );
 
-    track.addEventListener('ended', () => {
+    this.trackEndedHandler = () => {
       if (!this.manualStop) {
         publishError(this.source, new Error(`Nguồn ${this.source} đã kết thúc.`));
-        this.stop();
+        this.stop({ preserveError: true }).catch(() => {});
       }
-    });
+    };
+    track.addEventListener('ended', this.trackEndedHandler);
 
     this.audioContext = new AudioContext({ latencyHint: 'interactive' });
     logDiagnostic('audio-context', 'pending', `AudioContext: ${this.audioContext.state}.`, this.source);
     await this.audioContext.audioWorklet.addModule(chrome.runtime.getURL('audio-worklet.js'));
     await this.audioContext.resume();
+    observeAudioContext(this, this.source);
     logDiagnostic(
       'audio-context',
       this.audioContext.state === 'running' ? 'ok' : 'warning',
@@ -450,6 +527,18 @@ class DirectSttPipeline {
         durationMs: Math.round(Number(message.duration || 0) * 1000),
         receivedAt: Date.now()
       };
+      if (isFinal) {
+        const fingerprint = `${event.startMs}|${event.durationMs}|${event.text}`;
+        if (this.recentFinalFingerprints.has(fingerprint)) {
+          logDiagnostic('transcript', 'warning', 'Đã bỏ qua final transcript trùng lặp.', this.source);
+          return;
+        }
+        this.recentFinalFingerprints.set(fingerprint, event.receivedAt);
+        if (this.recentFinalFingerprints.size > 100) {
+          const oldest = this.recentFinalFingerprints.keys().next().value;
+          this.recentFinalFingerprints.delete(oldest);
+        }
+      }
 
       if (!this.receivedFirstTranscript) {
         this.receivedFirstTranscript = true;
@@ -472,6 +561,9 @@ class DirectSttPipeline {
       setSourceState(this.source, { requestId: message.request_id || null });
     } else if (message.type === 'Error') {
       publishError(this.source, new Error(message.description || message.message || 'Deepgram lỗi.'));
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        this.socket.close(4001, 'Deepgram stream error');
+      }
     }
   }
 
@@ -479,6 +571,7 @@ class DirectSttPipeline {
     if (this.manualStop || stopping || this.reconnectTimer) return;
     if (this.reconnectAttempts >= 3) {
       publishError(this.source, new Error(`Mất kết nối Deepgram (${event.code}); đã thử lại 3 lần.`));
+      this.stop({ preserveError: true }).catch(() => {});
       return;
     }
 
@@ -494,7 +587,7 @@ class DirectSttPipeline {
       if (this.manualStop || stopping) return;
       try {
         await this.connectSocket();
-        markSourceRecovered(this.source, { reconnectAttempts: 0 });
+        markSourceRecovered(this.source, { reconnectAttempts: this.reconnectAttempts });
       } catch (error) {
         publishError(this.source, error);
         this.scheduleReconnect({ code: 1006 });
@@ -502,11 +595,21 @@ class DirectSttPipeline {
     }, delay);
   }
 
-  async stop() {
+  stop(options = {}) {
+    if (!this.stopPromise) {
+      this.stopPromise = this.performStop(options);
+    }
+    return this.stopPromise;
+  }
+
+  async performStop({ preserveError = false } = {}) {
     this.manualStop = true;
     clearTimeout(this.reconnectTimer);
+    clearTimeout(this.reconnectStableTimer);
     this.reconnectTimer = null;
+    this.reconnectStableTimer = null;
     this.socketGeneration += 1;
+    const currentError = runtimeState.sources[this.source]?.error || null;
     setSourceState(this.source, { status: 'stopping', level: 0 });
 
     if (this.socket?.readyState === WebSocket.OPEN) {
@@ -526,19 +629,30 @@ class DirectSttPipeline {
     try { this.silentGain?.disconnect(); } catch {}
     try { this.playbackGain?.disconnect(); } catch {}
 
+    if (this.audioTrack && this.trackEndedHandler) {
+      this.audioTrack.removeEventListener('ended', this.trackEndedHandler);
+    }
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.audioTrack = null;
+    this.trackEndedHandler = null;
     this.workletNode = null;
     this.sourceNode = null;
     this.silentGain = null;
     this.playbackGain = null;
 
+    unobserveAudioContext(this);
     if (this.audioContext && this.audioContext.state !== 'closed') {
       try { await this.audioContext.close(); } catch {}
     }
     this.audioContext = null;
 
-    setSourceState(this.source, { status: 'stopped', level: 0, speech: false });
+    setSourceState(this.source, {
+      status: preserveError ? 'error' : 'stopped',
+      level: 0,
+      speech: false,
+      error: preserveError ? currentError : null
+    });
   }
 }
 
@@ -549,12 +663,17 @@ class BrowserSpeechPipeline {
     this.recognition = null;
     this.stream = null;
     this.audioContext = null;
+    this.audioTrack = null;
+    this.trackEndedHandler = null;
+    this.audioContextStateHandler = null;
+    this.audioRecoveryPromise = null;
     this.sourceNode = null;
     this.analyser = null;
     this.silentGain = null;
     this.levelTimer = null;
     this.restartTimer = null;
     this.startupTimer = null;
+    this.stopPromise = null;
     this.manualStop = false;
     this.generation = 0;
     this.sessionId = Date.now();
@@ -570,6 +689,15 @@ class BrowserSpeechPipeline {
     setSourceState('mic', { status: 'connecting', level: 0, error: null });
     try {
       this.stream = await createMicrophoneStream();
+      this.audioTrack = this.stream.getAudioTracks()[0] || null;
+      if (this.audioTrack) {
+        this.trackEndedHandler = () => {
+          if (this.manualStop) return;
+          publishError('mic', new Error('MIC_REMOVED|Microphone đã ngắt kết nối.'));
+          this.stop({ preserveError: true }).catch(() => {});
+        };
+        this.audioTrack.addEventListener('ended', this.trackEndedHandler);
+      }
       await this.startLevelMeter();
       await this.startRecognition();
     } catch (error) {
@@ -594,6 +722,7 @@ class BrowserSpeechPipeline {
   async startLevelMeter() {
     this.audioContext = new AudioContext({ latencyHint: 'interactive' });
     await this.audioContext.resume();
+    observeAudioContext(this, 'mic');
     this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
     this.analyser = this.audioContext.createAnalyser();
     this.analyser.fftSize = 512;
@@ -711,7 +840,14 @@ class BrowserSpeechPipeline {
     });
   }
 
-  async stop({ preserveError = false } = {}) {
+  stop(options = {}) {
+    if (!this.stopPromise) {
+      this.stopPromise = this.performStop(options);
+    }
+    return this.stopPromise;
+  }
+
+  async performStop({ preserveError = false } = {}) {
     this.manualStop = true;
     clearTimeout(this.restartTimer);
     clearTimeout(this.startupTimer);
@@ -733,12 +869,18 @@ class BrowserSpeechPipeline {
     try { this.sourceNode?.disconnect(); } catch {}
     try { this.analyser?.disconnect(); } catch {}
     try { this.silentGain?.disconnect(); } catch {}
+    if (this.audioTrack && this.trackEndedHandler) {
+      this.audioTrack.removeEventListener('ended', this.trackEndedHandler);
+    }
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.audioTrack = null;
+    this.trackEndedHandler = null;
     this.sourceNode = null;
     this.analyser = null;
     this.silentGain = null;
 
+    unobserveAudioContext(this);
     if (this.audioContext && this.audioContext.state !== 'closed') {
       try { await this.audioContext.close(); } catch {}
     }
@@ -800,15 +942,27 @@ async function createDesktopStream(streamId, canRequestAudioTrack) {
 }
 
 async function createMicrophoneStream() {
-  return navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    },
-    video: false
-  });
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
+      video: false
+    });
+  } catch (error) {
+    if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) {
+      throw new Error(
+        'MIC_PERMISSION_DENIED|Chrome chưa cho phép microphone. Bấm “Cấp quyền mic”, chọn Cho phép, rồi thử lại.'
+      );
+    }
+    if (error?.name === 'NotFoundError') {
+      throw new Error('MIC_NOT_FOUND|Không tìm thấy microphone khả dụng trên máy.');
+    }
+    throw error;
+  }
 }
 
 async function stopAll() {
@@ -828,9 +982,20 @@ async function stopAll() {
   }
   await persistenceQueue;
   stopping = false;
+  for (const source of Object.keys(runtimeState.sources)) {
+    runtimeState.sources[source] = {
+      ...runtimeState.sources[source],
+      status: 'stopped',
+      level: 0,
+      speech: false,
+      error: null,
+      updatedAt: nowIso()
+    };
+  }
   runtimeState.phase = 'idle';
   runtimeState.startedAt = null;
   runtimeState.config = null;
+  runtimeState.error = null;
   publishState();
 }
 
@@ -885,7 +1050,7 @@ async function startSession(config, tabCapture) {
   if (engine === 'browser') {
     const pipeline = new BrowserSpeechPipeline(runtimeConfig);
     pipelines.set('mic', pipeline);
-    tasks.push(pipeline.start());
+    tasks.push({ source: 'mic', promise: pipeline.start() });
   }
 
   if (engine === 'deepgram' && (source === 'tab' || source === 'both')) {
@@ -899,23 +1064,28 @@ async function startSession(config, tabCapture) {
       mediaFactory
     );
     pipelines.set('tab', pipeline);
-    tasks.push(pipeline.start());
+    tasks.push({ source: 'tab', promise: pipeline.start() });
   }
 
   if (engine === 'deepgram' && (source === 'mic' || source === 'both')) {
     const pipeline = new DirectSttPipeline('mic', runtimeConfig, createMicrophoneStream);
     pipelines.set('mic', pipeline);
-    tasks.push(pipeline.start());
+    tasks.push({ source: 'mic', promise: pipeline.start() });
   }
 
-  const results = await Promise.allSettled(tasks);
-  const failures = results.filter((result) => result.status === 'rejected');
+  const results = await Promise.allSettled(tasks.map((task) => task.promise));
+  const failures = results
+    .map((result, index) => ({ ...result, source: tasks[index].source }))
+    .filter((result) => result.status === 'rejected');
   if (failures.length === results.length && failures.length > 0) {
     await stopAll();
     throw failures[0].reason;
   }
 
-  failures.forEach((failure) => publishError(null, failure.reason));
+  failures.forEach((failure) => {
+    pipelines.delete(failure.source);
+    publishError(failure.source, failure.reason);
+  });
   runtimeState.phase = 'streaming';
   publishState();
   return { ok: true, state: serializeState() };
@@ -1008,3 +1178,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   return true;
 });
+
+export {
+  BrowserSpeechPipeline,
+  DirectSttPipeline,
+  createMicrophoneStream,
+  observeAudioContext,
+  resolveCredential,
+  runtimeState,
+  stopAll,
+  unobserveAudioContext
+};
