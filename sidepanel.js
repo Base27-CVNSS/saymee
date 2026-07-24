@@ -614,6 +614,7 @@ function applyRuntimeState(state) {
   updateTimer();
 
   if (state.error) showError(state.error);
+  else clearError();
 }
 
 function upsertTranscript(event) {

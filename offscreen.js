@@ -63,6 +63,25 @@ function setSourceState(source, patch) {
   publishState();
 }
 
+function markSourceRecovered(source, patch = {}) {
+  const previous = runtimeState.sources[source] || {};
+  const hadError = Boolean(previous.error);
+  runtimeState.sources[source] = {
+    ...previous,
+    ...patch,
+    status: patch.status || 'streaming',
+    error: null,
+    updatedAt: nowIso()
+  };
+  runtimeState.error = Object.values(runtimeState.sources)
+    .map((state) => state?.error)
+    .find(Boolean) || null;
+  if (hadError) {
+    logDiagnostic('recovery', 'ok', 'Nguồn đã phục hồi; trạng thái lỗi cũ được xóa.', source);
+  }
+  publishState();
+}
+
 function publishError(source, error) {
   const text = error?.message || String(error);
   logDiagnostic('error', 'error', text, source);
@@ -181,6 +200,9 @@ class DirectSttPipeline {
     this.silentGain = null;
     this.playbackGain = null;
     this.socket = null;
+    this.socketGeneration = 0;
+    this.connectPromise = null;
+    this.reconnectTimer = null;
     this.manualStop = false;
     this.reconnectAttempts = 0;
     this.utteranceCounter = 1;
@@ -201,7 +223,7 @@ class DirectSttPipeline {
       // Luôn tiêu thụ media trước, sau đó mới lấy token/mở WebSocket.
       await this.connectAudio();
       await this.connectSocket();
-      setSourceState(this.source, { status: 'streaming', level: 0 });
+      markSourceRecovered(this.source, { level: 0, reconnectAttempts: 0 });
       logDiagnostic('pipeline', 'ok', 'Audio và Deepgram đã sẵn sàng.', this.source);
     } catch (error) {
       await this.stop();
@@ -210,6 +232,15 @@ class DirectSttPipeline {
   }
 
   async connectSocket() {
+    if (this.connectPromise) return this.connectPromise;
+
+    this.connectPromise = this.openSocket().finally(() => {
+      this.connectPromise = null;
+    });
+    return this.connectPromise;
+  }
+
+  async openSocket() {
     const credential = await resolveCredential(this.config, this.source);
     const url = buildDeepgramUrl(this.config, this.source);
     const protocols = [credential.scheme, credential.value];
@@ -217,6 +248,8 @@ class DirectSttPipeline {
 
     await new Promise((resolve, reject) => {
       let settled = false;
+      let opened = false;
+      const generation = ++this.socketGeneration;
       const socket = new WebSocket(url, protocols);
       socket.binaryType = 'arraybuffer';
       this.socket = socket;
@@ -230,8 +263,13 @@ class DirectSttPipeline {
       }, 10000);
 
       socket.onopen = () => {
+        if (generation !== this.socketGeneration || this.manualStop) {
+          socket.close(1000, 'Stale connection');
+          return;
+        }
         clearTimeout(timeout);
         settled = true;
+        opened = true;
         this.reconnectAttempts = 0;
         logDiagnostic('websocket', 'ok', 'Deepgram WebSocket đã kết nối.', this.source);
         resolve();
@@ -248,6 +286,7 @@ class DirectSttPipeline {
 
       socket.onmessage = (event) => this.handleDeepgramMessage(event.data);
       socket.onclose = (event) => {
+        if (generation !== this.socketGeneration) return;
         if (!settled) {
           clearTimeout(timeout);
           settled = true;
@@ -255,7 +294,7 @@ class DirectSttPipeline {
           reject(new Error(`Deepgram đóng kết nối (${event.code})${reason}.`));
           return;
         }
-        if (!this.manualStop && !stopping) this.scheduleReconnect(event);
+        if (opened && !this.manualStop && !stopping) this.scheduleReconnect(event);
       };
     });
   }
@@ -389,6 +428,7 @@ class DirectSttPipeline {
   }
 
   scheduleReconnect(event) {
+    if (this.manualStop || stopping || this.reconnectTimer) return;
     if (this.reconnectAttempts >= 3) {
       publishError(this.source, new Error(`Mất kết nối Deepgram (${event.code}); đã thử lại 3 lần.`));
       return;
@@ -401,11 +441,12 @@ class DirectSttPipeline {
       reconnectAttempts: this.reconnectAttempts
     });
 
-    setTimeout(async () => {
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
       if (this.manualStop || stopping) return;
       try {
         await this.connectSocket();
-        setSourceState(this.source, { status: 'streaming', reconnectAttempts: 0 });
+        markSourceRecovered(this.source, { reconnectAttempts: 0 });
       } catch (error) {
         publishError(this.source, error);
         this.scheduleReconnect({ code: 1006 });
@@ -415,6 +456,9 @@ class DirectSttPipeline {
 
   async stop() {
     this.manualStop = true;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.socketGeneration += 1;
     setSourceState(this.source, { status: 'stopping', level: 0 });
 
     if (this.socket?.readyState === WebSocket.OPEN) {
@@ -429,16 +473,22 @@ class DirectSttPipeline {
     this.socket = null;
 
     try { this.workletNode?.disconnect(); } catch {}
+    if (this.workletNode?.port) this.workletNode.port.onmessage = null;
     try { this.sourceNode?.disconnect(); } catch {}
     try { this.silentGain?.disconnect(); } catch {}
     try { this.playbackGain?.disconnect(); } catch {}
 
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.workletNode = null;
+    this.sourceNode = null;
+    this.silentGain = null;
+    this.playbackGain = null;
 
     if (this.audioContext && this.audioContext.state !== 'closed') {
       try { await this.audioContext.close(); } catch {}
     }
+    this.audioContext = null;
 
     setSourceState(this.source, { status: 'stopped', level: 0, speech: false });
   }
@@ -456,6 +506,7 @@ class BrowserSpeechPipeline {
     this.silentGain = null;
     this.levelTimer = null;
     this.restartTimer = null;
+    this.startupTimer = null;
     this.manualStop = false;
     this.generation = 0;
     this.sessionId = Date.now();
@@ -570,6 +621,7 @@ class BrowserSpeechPipeline {
 
       if (['not-allowed', 'service-not-allowed', 'audio-capture'].includes(event.error)) {
         this.manualStop = true;
+        this.stop({ preserveError: true }).catch(() => {});
       }
     };
 
@@ -589,12 +641,14 @@ class BrowserSpeechPipeline {
         startupSettled = true;
         reject(new Error('BROWSER_STT_TIMEOUT|Chrome không khởi động được nhận dạng giọng nói.'));
       }, 8000);
+      this.startupTimer = timeout;
 
       recognition.onstart = () => {
         clearTimeout(timeout);
+        this.startupTimer = null;
         if (startupSettled) return;
         startupSettled = true;
-        setSourceState('mic', { status: 'streaming', level: 0 });
+        markSourceRecovered('mic', { level: 0 });
         resolve();
       };
 
@@ -602,31 +656,51 @@ class BrowserSpeechPipeline {
         recognition.start();
       } catch (error) {
         clearTimeout(timeout);
+        this.startupTimer = null;
         startupSettled = true;
         reject(error);
       }
     });
   }
 
-  async stop() {
+  async stop({ preserveError = false } = {}) {
     this.manualStop = true;
     clearTimeout(this.restartTimer);
+    clearTimeout(this.startupTimer);
     clearInterval(this.levelTimer);
+    this.restartTimer = null;
+    this.startupTimer = null;
+    this.levelTimer = null;
+    const currentError = runtimeState.sources.mic?.error || null;
     setSourceState('mic', { status: 'stopping', level: 0 });
 
-    try { this.recognition?.abort(); } catch {}
+    if (this.recognition) {
+      this.recognition.onresult = null;
+      this.recognition.onerror = null;
+      this.recognition.onend = null;
+      this.recognition.onstart = null;
+      try { this.recognition.abort(); } catch {}
+    }
     this.recognition = null;
     try { this.sourceNode?.disconnect(); } catch {}
     try { this.analyser?.disconnect(); } catch {}
     try { this.silentGain?.disconnect(); } catch {}
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
+    this.sourceNode = null;
+    this.analyser = null;
+    this.silentGain = null;
 
     if (this.audioContext && this.audioContext.state !== 'closed') {
       try { await this.audioContext.close(); } catch {}
     }
     this.audioContext = null;
-    setSourceState('mic', { status: 'stopped', level: 0, speech: false });
+    setSourceState('mic', {
+      status: preserveError ? 'error' : 'stopped',
+      level: 0,
+      speech: false,
+      error: preserveError ? currentError : null
+    });
   }
 }
 
@@ -704,22 +778,30 @@ async function stopAll() {
 async function startSession(config, tabCapture) {
   await stopAll();
 
-  const engine = config.engine || 'browser';
-  if (engine === 'browser' && config.source !== 'mic') {
+  const engine = config.engine || 'deepgram';
+  const source = config.source || (engine === 'browser' ? 'mic' : 'tab');
+  if (!['deepgram', 'browser'].includes(engine)) {
+    throw new Error(`ENGINE_UNSUPPORTED|Engine không được hỗ trợ: ${engine}.`);
+  }
+  if (!['tab', 'mic', 'both'].includes(source)) {
+    throw new Error(`SOURCE_UNSUPPORTED|Nguồn âm thanh không được hỗ trợ: ${source}.`);
+  }
+  if (engine === 'browser' && source !== 'mic') {
     throw new Error(
       'ENGINE_SOURCE_MISMATCH|Nhận dạng bằng trình duyệt chỉ hỗ trợ Microphone. Muốn ghi âm tab, hãy chọn Deepgram.'
     );
   }
+  const runtimeConfig = { ...config, engine, source };
 
   runtimeState.phase = 'starting';
   runtimeState.diagnostics = [];
   runtimeState.startedAt = Date.now();
   runtimeState.config = {
-    source: config.source,
+    source,
     engine,
-    language: config.language,
-    model: config.model,
-    diarize: Boolean(config.diarize)
+    language: runtimeConfig.language || 'vi',
+    model: runtimeConfig.model || 'nova-3',
+    diarize: Boolean(runtimeConfig.diarize)
   };
   runtimeState.sources = {};
   runtimeState.error = null;
@@ -729,27 +811,27 @@ async function startSession(config, tabCapture) {
   const tasks = [];
 
   if (engine === 'browser') {
-    const pipeline = new BrowserSpeechPipeline(config);
+    const pipeline = new BrowserSpeechPipeline(runtimeConfig);
     pipelines.set('mic', pipeline);
     tasks.push(pipeline.start());
   }
 
-  if (engine === 'deepgram' && (config.source === 'tab' || config.source === 'both')) {
+  if (engine === 'deepgram' && (source === 'tab' || source === 'both')) {
     if (!tabCapture?.streamId) throw new Error('Thiếu stream ID của tab.');
     const mediaFactory = tabCapture.captureType === 'desktop'
       ? () => createDesktopStream(tabCapture.streamId, tabCapture.canRequestAudioTrack)
       : () => createTabStream(tabCapture.streamId);
     const pipeline = new DirectSttPipeline(
       'tab',
-      config,
+      runtimeConfig,
       mediaFactory
     );
     pipelines.set('tab', pipeline);
     tasks.push(pipeline.start());
   }
 
-  if (engine === 'deepgram' && (config.source === 'mic' || config.source === 'both')) {
-    const pipeline = new DirectSttPipeline('mic', config, createMicrophoneStream);
+  if (engine === 'deepgram' && (source === 'mic' || source === 'both')) {
+    const pipeline = new DirectSttPipeline('mic', runtimeConfig, createMicrophoneStream);
     pipelines.set('mic', pipeline);
     tasks.push(pipeline.start());
   }
