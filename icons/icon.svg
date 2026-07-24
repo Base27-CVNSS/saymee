@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Saymee</title>
+  <desc id="desc">Biểu tượng chữ S dạng sóng nói trên nền chuyển sắc trẻ trung.</desc>
+  <defs>
+    <linearGradient id="bg" x1="16" y1="12" x2="116" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00D4FF"/>
+      <stop offset=".46" stop-color="#6D4AFF"/>
+      <stop offset="1" stop-color="#FF3CAC"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="36" y1="28" x2="92" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F8ECFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="33" fill="url(#bg)"/>
+  <path d="M25 45C29 25 47 16 69 18c18 1 31 8 39 20" fill="none" stroke="#FFF" stroke-opacity=".2" stroke-width="7" stroke-linecap="round"/>
+  <path d="M86 42c-7-10-21-14-34-9-11 4-15 13-11 21 4 7 14 9 25 11 15 3 24 8 23 19-1 13-14 22-30 22-13 0-25-5-32-14"
+        fill="none" stroke="url(#shine)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="101" cy="30" r="6" fill="#FFF"/>
+  <path d="M102 19v22M91 30h22" stroke="#FFF" stroke-opacity=".74" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="25" cy="78" r="4" fill="#73F7FF"/>
+  <circle cx="25" cy="91" r="3" fill="#FFB4EA"/>
+</svg>
